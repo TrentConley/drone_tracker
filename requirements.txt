@@ -1,0 +1,8 @@
+djitellopy==2.5 # Check for latest compatible version
+opencv-python==4.9.0.80 # Or specific version used in originals
+insightface==0.7.3
+onnxruntime==1.17.1 # CPU version, use onnxruntime-gpu for CUDA
+psycopg[binary]==3.1.18 # For PostgreSQL interaction
+pgvector==0.2.3 # For vector similarity search in Postgres
+numpy==1.26.4
+python-dotenv==1.0.1 
