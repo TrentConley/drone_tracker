@@ -5,13 +5,14 @@ import numpy as np
 import cv2 # Using OpenCV for image handling
 import logging
 import os
+import sys # Import sys to check platform
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class FaceRecognizer:
     """
     Handles face detection and embedding extraction using InsightFace.
-    Configurable for CPU or GPU execution.
+    Configurable for CPU or GPU execution (CUDA or MPS).
     """
     def __init__(self, det_thresh=0.5, model_pack_name='buffalo_l', use_gpu=False):
         """
@@ -20,34 +21,52 @@ class FaceRecognizer:
         Args:
             det_thresh (float): Detection confidence threshold.
             model_pack_name (str): Name of the model pack (e.g., 'buffalo_l', 'antelopev2').
-            use_gpu (bool): Whether to attempt using CUDA for processing.
+            use_gpu (bool): Whether to attempt using GPU (CUDA on Linux/Windows, MPS on macOS).
         """
         self.app = None
         providers = ['CPUExecutionProvider']
         ctx_id = 0 # CPU context ID
 
         if use_gpu:
-            # Check for CUDAExecutionProvider availability (requires onnxruntime-gpu)
             try:
                 import onnxruntime
                 available_providers = onnxruntime.get_available_providers()
                 logging.info(f"Available ONNXRuntime Providers: {available_providers}")
-                if 'CUDAExecutionProvider' in available_providers:
+
+                # Check for MPS (CoreML) on macOS
+                if sys.platform == "darwin":
+                    if 'CoreMLExecutionProvider' in available_providers:
+                        providers = ['CoreMLExecutionProvider', 'CPUExecutionProvider']
+                        # ctx_id remains 0 for CoreML according to some documentation,
+                        # but InsightFace's prepare might handle it.
+                        # Verify if specific ctx_id is needed for CoreML if issues arise.
+                        logging.info("Configured to use CoreMLExecutionProvider (MPS) on macOS.")
+                    else:
+                        logging.warning("use_gpu=True on macOS but CoreMLExecutionProvider not found. Falling back to CPU.")
+                        logging.warning("Ensure you have onnxruntime >= 1.10 (check compatibility).")
+
+                # Check for CUDA on other platforms (Linux/Windows)
+                elif 'CUDAExecutionProvider' in available_providers:
                     providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-                    ctx_id = 0 # Use GPU device 0
+                    ctx_id = 0 # Use GPU device 0 by default for CUDA
                     logging.info("Configured to use CUDAExecutionProvider.")
                 else:
-                    logging.warning("use_gpu=True but CUDAExecutionProvider not found. Falling back to CPU.")
+                    logging.warning(f"use_gpu=True on {sys.platform} but CUDAExecutionProvider not found. Falling back to CPU.")
+                    logging.warning("Ensure 'onnxruntime-gpu' is installed and CUDA is configured correctly.")
+
             except ImportError:
                  logging.warning("onnxruntime not found. Cannot check for GPU providers. Using CPU.")
             except Exception as e:
                  logging.warning(f"Error checking ONNXRuntime providers: {e}. Using CPU.")
+        else:
+            logging.info("Configured to use CPUExecutionProvider.")
 
-        logging.info(f"Initializing InsightFace FaceAnalysis with model: {model_pack_name}, providers: {providers}")
+        logging.info(f"Initializing InsightFace FaceAnalysis with model: {model_pack_name}, selected providers: {providers}")
         try:
             self.app = FaceAnalysis(name=model_pack_name,
                                     allowed_modules=['detection', 'recognition'],
                                     providers=providers)
+            # Set det_thresh during prepare, not detection call
             self.app.prepare(ctx_id=ctx_id, det_thresh=det_thresh)
             logging.info("InsightFace models loaded successfully.")
         except FileNotFoundError:
@@ -59,7 +78,9 @@ class FaceRecognizer:
             logging.error(f"Error initializing InsightFace: {e}")
             logging.error("Ensure 'insightface' and 'onnxruntime' (or 'onnxruntime-gpu') are installed.")
             if 'CUDAExecutionProvider' in providers:
-                logging.error("If using GPU, ensure CUDA/cuDNN are installed and compatible with ONNXRuntime.")
+                logging.error("If using GPU (CUDA), ensure CUDA/cuDNN are installed and compatible with ONNXRuntime.")
+            if 'CoreMLExecutionProvider' in providers:
+                logging.error("If using GPU (MPS), ensure you are on macOS with a compatible ONNXRuntime version.")
             self.app = None
 
     def analyze_frame(self, frame: np.ndarray):
