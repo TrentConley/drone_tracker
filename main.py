@@ -4,6 +4,8 @@ import logging
 import os
 from dotenv import load_dotenv
 import numpy as np # Needed for clamping
+import camera_utils
+from ultralytics import YOLO
 
 # Import project modules
 from drone_handler import DroneHandler
@@ -12,36 +14,32 @@ import db_utils
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-load_dotenv() # Load environment variables from .env file
-
-# Face recognition settings from environment or defaults
-USE_GPU = os.getenv('USE_GPU', 'false').lower() == 'true'
-MODEL_PACK_NAME = os.getenv('MODEL_PACK_NAME', 'buffalo_l')
 
 # Time to run before landing (seconds)
 FLIGHT_DURATION = 120 # Increased duration for testing centering
 
-# Cooldown period (seconds) after recognizing someone before logging again
-RECOGNITION_COOLDOWN = 5
-
 # --- Drone Control Parameters ---
-# Target face height as a ratio of the frame height
-TARGET_FACE_HEIGHT_RATIO = 0.25 # Aim for face to be 25% of frame height
-# Proportional gains for controller ( এগুলো পরিবর্তন করুন / Adjust these values)
+# Target face height as a ratio of the frame height (adjust based on testing for ~0.5m distance)
+TARGET_FACE_HEIGHT_RATIO = 0.25 # Aim for face bbox height to be 25% of frame height
+# Proportional gains for controller (TUNE THESE VALUES)
 KP_YAW = 0.25   # How strongly to react to horizontal error
-KP_UD = 0.2     # How strongly to react to vertical error (REDUCED from 0.4)
-KP_FB = 0.3     # How strongly to react to size error (forward/backward)
+KP_UD = 0.3     # How strongly to react to vertical error
+KP_FB = 0.4     # How strongly to react to size error (forward/backward)
 # Maximum control velocities (range: -100 to 100)
 MAX_YAW_VEL = 60
-MAX_UD_VEL = 70
-MAX_FB_VEL = 50
+MAX_UD_VEL = 50 # Reduced max vertical speed for stability
+MAX_FB_VEL = 40 # Reduced max forward/backward speed for safety
 # Dead zone for control errors (ignore small errors to prevent jitter)
-ERROR_DEAD_ZONE_X = 15  # Pixels
-ERROR_DEAD_ZONE_Y = 15  # Pixels
-ERROR_DEAD_ZONE_H = 10 # Pixels (for height difference)
+ERROR_DEAD_ZONE_X = 20  # Pixels from center X
+ERROR_DEAD_ZONE_Y = 20  # Pixels from center Y
+ERROR_DEAD_ZONE_H = 15  # Pixels difference from target height
 # Time to hover without face before searching (seconds)
 SEARCH_TIMEOUT = 3.0
-SEARCH_YAW_VEL = 25 # Slow rotation speed when searching
+SEARCH_YAW_VEL = 30 # Slow rotation speed when searching
+
+load_dotenv()
+USE_GPU = os.getenv('USE_GPU', 'false').lower() == 'true'
+MODEL_PACK_NAME = os.getenv('MODEL_PACK_NAME', 'buffalo_l')
 
 # --- Helper Functions ---
 def draw_face_info(frame, faces_data, target_face_index):
@@ -49,6 +47,8 @@ def draw_face_info(frame, faces_data, target_face_index):
        Highlights the target face.
     """
     for i, face_data in enumerate(faces_data):
+        # Use original_index if available (added during processing), else use current index i
+        current_index = face_data.get('original_index', i)
         bbox = face_data['bbox']
         name = face_data.get('name') # Get name added during processing
         distance = face_data.get('distance')
@@ -57,7 +57,7 @@ def draw_face_info(frame, faces_data, target_face_index):
         color = (0, 255, 0) if name else (0, 0, 255)
         thickness = 2
         # Highlight the target face
-        if i == target_face_index:
+        if current_index == target_face_index:
             color = (255, 255, 0) # Cyan for target
             thickness = 3
 
@@ -91,24 +91,25 @@ def main():
     # 1. Initialize Database
     logging.info("Initializing database...")
     if not db_utils.initialize_database():
-        logging.error("Database initialization failed. Please check configuration and server status. Exiting.")
+        logging.error("Database initialization failed. Exiting.")
         return
     logging.info("Database ready.")
-
     # 2. Initialize Face Recognizer
     logging.info(f"Initializing face recognizer (GPU: {USE_GPU}, Model: {MODEL_PACK_NAME})...")
     face_recognizer = FaceRecognizer(use_gpu=USE_GPU, model_pack_name=MODEL_PACK_NAME)
     if face_recognizer.app is None:
-        logging.error("Failed to initialize face recognizer. Check models and dependencies. Exiting.")
+        logging.error("Failed to initialize face recognizer. Exiting.")
         return
     logging.info("Face recognizer ready.")
+    # 3. Initialize YOLOv10 + ByteTrack model for person tracking
+    model = YOLO('yolov10s.pt')
+    logging.info('Loaded YOLOv10s for person tracking')
 
     # 3. Initialize Drone Handler
     logging.info("Initializing drone handler...")
     drone = DroneHandler()
 
     keep_running = True
-    recognized_log = {} # Track last recognition time per person
 
     try:
         # 4. Connect to Drone
@@ -132,11 +133,14 @@ def main():
         logging.info(f"Drone airborne. Starting recognition and centering loop for {FLIGHT_DURATION} seconds.")
 
         start_time = time.time()
-        frame_count = 0
-        fps = 0
-        last_face_seen_time = time.time() # Track when a face was last detected
 
-        # 7. Main Loop (Control, Recognize, Display)
+        # Setup tracking state
+        target_id = None
+        target_name = None
+        lost_frames = 0
+        MAX_LOST_FRAMES = 30
+
+        # 7. Main Loop (Person detection + recognition + distance control)
         while keep_running and (time.time() - start_time) < FLIGHT_DURATION:
             loop_start_time = time.time()
 
@@ -144,129 +148,78 @@ def main():
             frame = drone.get_frame()
             if frame is None:
                 logging.warning("Failed to get frame from drone. Skipping cycle.")
+                # Send hover command if frame fails to prevent drift
                 if drone.is_flying:
                      drone.send_rc_control(0, 0, 0, 0)
-                time.sleep(0.1)
+                time.sleep(0.1) # Avoid busy-waiting
                 continue
 
-            # --- Face Detection and Recognition ---
+            # 1) Run ByteTrack person detection
+            results = model.track(frame, tracker='bytetrack.yaml', classes=[0], persist=True, stream=False)
+            if results:
+                res = results[0]
+                annotated = res.plot()
+                boxes = res.boxes.xyxy.cpu().numpy()
+                # Check if tracks exist before accessing id
+                if res.boxes.id is not None:
+                    ids = res.boxes.id.cpu().numpy().astype(int)
+                else:
+                    ids = np.empty((0,), dtype=int) # No tracks
+            else:
+                annotated = frame.copy()
+                boxes = np.empty((0,4))
+                ids = np.empty((0,), dtype=int)
             frame_height, frame_width, _ = frame.shape
             frame_center_x = frame_width // 2
-            frame_center_y = frame_height // 2
-            target_face_height = frame_height * TARGET_FACE_HEIGHT_RATIO
-
-            # Analyze frame for faces
-            faces_data = face_recognizer.analyze_frame(frame)
             current_time = time.time()
-            recognized_faces = []
-            unknown_faces = []
 
-            # Process and classify all detected faces
-            if faces_data:
-                last_face_seen_time = current_time # Reset timer
-                for i, face in enumerate(faces_data):
-                    face['original_index'] = i # Keep track of original index for display
-                    bbox = face['bbox']
-                    face['area'] = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-                    embedding = face.get('embedding')
-                    name = None
-                    distance = None
-                    if embedding is not None:
-                        name, distance = db_utils.find_similar_face(embedding)
-                        face['name'] = name # Add recognition result directly to face data
-                        face['distance'] = distance
-                        if name:
-                            recognized_faces.append(face)
-                             # Log recognized person if cooldown period passed
-                            last_seen = recognized_log.get(name, 0)
-                            if current_time - last_seen > RECOGNITION_COOLDOWN:
-                                logging.info(f"RECOGNIZED: {name} (Distance: {distance:.4f}) - Tracking")
-                                recognized_log[name] = current_time
-                        else:
-                            unknown_faces.append(face)
-                    else:
-                        # If embedding failed, treat as unknown but don't add to unknown_faces list for targeting
-                        logging.warning(f"Face {i} detected but embedding extraction failed.")
-                        face['name'] = None
-                        face['distance'] = None
-            # else: logging.debug("No faces detected in this frame.")
-
-            # --- Target Selection Logic ---
-            target_face = None
-            target_face_index = -1 # Original index for highlighting
-
-            if recognized_faces:
-                # Priority 1: Target the largest recognized face
-                recognized_faces.sort(key=lambda x: x['area'], reverse=True)
-                target_face = recognized_faces[0]
-                target_face_index = target_face['original_index']
-                logging.debug(f"Targeting recognized face: {target_face['name']}")
-            elif unknown_faces:
-                # Priority 2: Target the largest unknown face
-                unknown_faces.sort(key=lambda x: x['area'], reverse=True)
-                target_face = unknown_faces[0]
-                target_face_index = target_face['original_index']
-                logging.debug("Targeting largest unknown face.")
-            # else: No faces detected, target_face remains None
-
-            # --- Drone Control Logic ---
-            yaw_velocity = 0
-            ud_velocity = 0
-            fb_velocity = 0
-
-            if target_face and drone.is_flying:
-                bbox = target_face['bbox']
-                face_center_x = (bbox[0] + bbox[2]) // 2
-                face_center_y = (bbox[1] + bbox[3]) // 2
-                face_height = bbox[3] - bbox[1]
-
-                error_x = face_center_x - frame_center_x
-                error_y = frame_center_y - face_center_y
-                error_fb = target_face_height - face_height
-
-                if abs(error_x) > ERROR_DEAD_ZONE_X:
-                    yaw_velocity = KP_YAW * error_x
-                if abs(error_y) > ERROR_DEAD_ZONE_Y:
-                    ud_velocity = KP_UD * error_y
-                if abs(error_fb) > ERROR_DEAD_ZONE_H:
-                    fb_velocity = KP_FB * error_fb
-
-                yaw_velocity = int(np.clip(yaw_velocity, -MAX_YAW_VEL, MAX_YAW_VEL))
-                ud_velocity = int(np.clip(ud_velocity, -MAX_UD_VEL, MAX_UD_VEL))
-                fb_velocity = int(np.clip(fb_velocity, -MAX_FB_VEL, MAX_FB_VEL))
-
-                logging.debug(f"Control: Target '{target_face.get('name', 'Unknown')}' Err(x:{error_x}, y:{error_y}, h:{error_fb}) -> Vel(yaw:{yaw_velocity}, ud:{ud_velocity}, fb:{fb_velocity})")
-                drone.send_rc_control(0, fb_velocity, ud_velocity, yaw_velocity)
-
-            elif drone.is_flying:
-                # No target face selected (either no faces or only faces with failed embeddings)
-                time_since_last_face = current_time - last_face_seen_time
-                if time_since_last_face < SEARCH_TIMEOUT:
-                    logging.debug("No targetable face detected, hovering...")
-                    drone.send_rc_control(0, 0, 0, 0)
+            # 2) Lock onto a recognized face or track existing target
+            if target_id is None:
+                faces = face_recognizer.analyze_frame(frame)
+                for f in faces:
+                    emb = f.get('embedding')
+                    if emb is None: continue
+                    name, _ = db_utils.find_similar_face(emb)
+                    if not name: continue
+                    # containment match
+                    fb = f['bbox']; fcx=(fb[0]+fb[2])/2; fcy=(fb[1]+fb[3])/2
+                    for box, tid in zip(boxes, ids):
+                        if box[0] <= fcx <= box[2] and box[1] <= fcy <= box[3]:
+                            target_id, target_name = tid, name
+                            lost_frames = 0
+                            logging.info(f"Locked on {name} with track ID {tid}")
+                            break
+                    if target_id is not None: break
+                # rotate to search if no lock yet
+                if target_id is None and drone.is_flying:
+                    drone.send_rc_control(0, 0, 0, SEARCH_YAW_VEL)
+            else:
+                # track and move towards 0.5m distance
+                if target_id in ids and drone.is_flying:
+                    lost_frames = 0
+                    idx = np.where(ids == target_id)[0][0]
+                    x1,y1,x2,y2 = boxes[idx].astype(int)
+                    person_width = x2 - x1
+                    dist_m = camera_utils.calculate_distance_from_width(person_width, 'tello')
+                    err_x = ((x1+x2)//2) - frame_center_x
+                    err_fb = dist_m - 0.5
+                    yaw_vel = int(np.clip(KP_YAW * err_x, -MAX_YAW_VEL, MAX_YAW_VEL))
+                    fb_vel = int(np.clip(KP_FB * err_fb, -MAX_FB_VEL, MAX_FB_VEL))
+                    logging.info(f"Control -> yaw: {yaw_vel}, fb: {fb_vel}, dist: {dist_m:.2f}m")
+                    drone.send_rc_control(0, fb_vel, 0, yaw_vel)
+                    # highlight locked target
+                    cv2.rectangle(annotated,(x1,y1),(x2,y2),(0,255,0),4)
+                    cv2.putText(annotated, f"{target_name} {dist_m:.2f}m", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0),2)
                 else:
-                    logging.debug(f"No targetable face detected for {time_since_last_face:.1f}s, searching...")
+                    lost_frames += 1
+                    if lost_frames > MAX_LOST_FRAMES:
+                        logging.info(f"Lost track of {target_name}, resetting.")
+                        target_id = None
+                if target_id is None and drone.is_flying:
                     drone.send_rc_control(0, 0, 0, SEARCH_YAW_VEL)
 
-            # --- Display Information ---
-            # Calculate FPS
-            frame_count += 1
-            elapsed_time = time.time() - loop_start_time
-            if elapsed_time > 0:
-                 fps = 1.0 / elapsed_time
-
-            # Draw info on the frame, highlighting the target
-            display_frame = draw_face_info(frame.copy(), faces_data, target_face_index)
-
-            # Draw frame center (already done in draw_face_info if needed, or keep here)
-            # cv2.circle(display_frame, (frame_center_x, frame_center_y), 5, (255, 0, 0), -1)
-
-            # Add FPS to display
-            cv2.putText(display_frame, f"FPS: {fps:.1f}", (display_frame.shape[1] - 100, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-            # Display the frame
-            cv2.imshow("Drone Facial Recognition", display_frame)
+            # Display output
+            cv2.imshow("Drone Facial Recognition", annotated)
 
             # Exit condition
             key = cv2.waitKey(1) & 0xFF
@@ -298,9 +251,9 @@ def main():
                 logging.info("Ensuring drone is landed...")
                 # Send zero velocity before landing
                 drone.send_rc_control(0, 0, 0, 0)
-                time.sleep(0.5)
+                time.sleep(0.5) # Brief pause after zeroing velocity
                 drone.land()
-                time.sleep(5) # Wait for landing
+                time.sleep(5) # Wait for landing process
             drone.disconnect()
         logging.info("--- Application Finished ---")
 

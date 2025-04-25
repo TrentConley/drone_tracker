@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from ultralytics import YOLO
 from face_recognizer import FaceRecognizer
 import db_utils
+import camera_utils # Import our new module
 
 # --- Configuration ---
 # Parse command-line arguments for debugging
@@ -56,6 +57,8 @@ if __name__ == '__main__':
     target_name = None
     lost_frames = 0
     MAX_LOST_FRAMES = 30
+    # Store calculated distance
+    current_distance_m = None
 
     # Stream from camera, track only class 0=person, persist IDs
     results = model.track(
@@ -90,20 +93,37 @@ if __name__ == '__main__':
             # check if the person is still tracked
             if target_id in ids:
                 lost_frames = 0
+                # Estimate distance of locked person using bounding box width
+                idx = np.where(ids == target_id)[0][0]
+                x1, y1, x2, y2 = boxes[idx].astype(int)
+
+                person_width_px = x2 - x1
+
+                # Calculate distance using camera utils (specify 'macbook' for this test script)
+                current_distance_m = camera_utils.calculate_distance_from_width(person_width_px, 'macbook')
+
+                # Highlight locked-on target in bright green
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 4)
+
+                # Display name and distance
+                dist_text = f"{current_distance_m:.2f}m" if current_distance_m is not None else "Dist: N/A"
+                label_text = f"{target_name} ({dist_text})"
+                cv2.putText(annotated, label_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+                if current_distance_m is not None:
+                    logging.info(f"Distance[{target_name}] = {current_distance_m:.3f} m")
+                else:
+                    logging.debug(f"Could not calculate distance for {target_name} (width: {person_width_px}px)")
             else:
                 lost_frames += 1
+                current_distance_m = None # Lost track, distance is unknown
                 if lost_frames > MAX_LOST_FRAMES:
                     logging.info(f"Lost track of '{target_name}' (ID {target_id}), resetting target.")
                     target_id = None
                     target_name = None
-            # overlay target box if still present
-            if target_id in ids:
-                idx = np.where(ids == target_id)[0][0]
-                x1, y1, x2, y2 = boxes[idx].astype(int)
-                # Highlight locked-on target in bright green
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 4)
-                cv2.putText(annotated, target_name, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
         else:
+            # Reset distance when searching
+            current_distance_m = None
             # run face detection & recognition until we lock on
             faces = face_recognizer.analyze_frame(frame)
             # use face center-point containment to lock onto the recognized person
@@ -124,6 +144,9 @@ if __name__ == '__main__':
                 fcy = (fb[1] + fb[3]) / 2
                 # find which person box contains the face center
                 for box, tid in zip(boxes, ids):
+                    # check containment
+                    in_box = (box[0] <= fcx <= box[2]) and (box[1] <= fcy <= box[3])
+                    logging.debug(f"Containment check: face_center=({fcx:.1f},{fcy:.1f}), box={box.astype(int)}, id={tid}, in_box={in_box}")
                     if box[0] <= fcx <= box[2] and box[1] <= fcy <= box[3]:
                         target_id = tid
                         target_name = name
