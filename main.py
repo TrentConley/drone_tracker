@@ -26,7 +26,7 @@ KP_YAW = 0.25   # How strongly to react to horizontal error
 KP_UD = 0.3     # How strongly to react to vertical error
 KP_FB = 0.4     # How strongly to react to size error (forward/backward)
 # Maximum control velocities (range: -100 to 100)
-MAX_YAW_VEL = 60
+MAX_YAW_VEL = 20 # Reduced from 60
 MAX_UD_VEL = 50 # Reduced max vertical speed for stability
 MAX_FB_VEL = 40 # Reduced max forward/backward speed for safety
 # Dead zone for control errors (ignore small errors to prevent jitter)
@@ -35,7 +35,7 @@ ERROR_DEAD_ZONE_Y = 20  # Pixels from center Y
 ERROR_DEAD_ZONE_H = 15  # Pixels difference from target height
 # Time to hover without face before searching (seconds)
 SEARCH_TIMEOUT = 3.0
-SEARCH_YAW_VEL = 30 # Slow rotation speed when searching
+SEARCH_YAW_VEL = 10 # Reduced from 30 - Slow rotation speed when searching
 
 load_dotenv()
 USE_GPU = os.getenv('USE_GPU', 'false').lower() == 'true'
