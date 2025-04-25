@@ -158,6 +158,33 @@ class DroneHandler:
             # State is uncertain, might still be flying
             return False
 
+    def send_rc_control(self, left_right, forward_backward, up_down, yaw):
+        """Sends RC control commands directly to the drone."""
+        if not self.is_connected:
+            logging.warning("Cannot send RC control: Drone not connected.")
+            return False
+        if not self.is_flying:
+            # Prevent sending movement commands if drone is not airborne (except hover)
+            # Allow hover (all zeros) to be sent from ground state to potentially stop previous commands.
+            if not (left_right == 0 and forward_backward == 0 and up_down == 0 and yaw == 0):
+                 logging.warning("Cannot send movement RC control: Drone not flying.")
+                 return False
+
+        try:
+            # Ensure values are within the Tello SDK range (-100 to 100)
+            # Although main.py should already clamp, adding safety here.
+            lr = int(max(-100, min(100, left_right)))
+            fb = int(max(-100, min(100, forward_backward)))
+            ud = int(max(-100, min(100, up_down)))
+            yw = int(max(-100, min(100, yaw)))
+
+            self.drone.send_rc_control(lr, fb, ud, yw)
+            # logging.debug(f"Sent RC Command: lr={lr}, fb={fb}, ud={ud}, yw={yw}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to send RC control command: {e}")
+            return False
+
     def hover(self):
         """Commands the drone to hover in place by sending zero movement commands."""
         if not self.is_connected:
@@ -167,7 +194,8 @@ class DroneHandler:
         # This is crucial especially if previous RC commands were sent
         # logging.debug("Sending hover command (RC 0,0,0,0).")
         try:
-            self.drone.send_rc_control(0, 0, 0, 0)
+            # self.drone.send_rc_control(0, 0, 0, 0) # No need to call self.drone directly anymore
+            self.send_rc_control(0, 0, 0, 0) # Use the new wrapper method
             return True
         except Exception as e:
             logging.error(f"Failed to send hover command: {e}")

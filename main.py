@@ -3,6 +3,7 @@ import time
 import logging
 import os
 from dotenv import load_dotenv
+import numpy as np # Needed for clamping
 
 # Import project modules
 from drone_handler import DroneHandler
@@ -17,33 +18,57 @@ load_dotenv() # Load environment variables from .env file
 USE_GPU = os.getenv('USE_GPU', 'false').lower() == 'true'
 MODEL_PACK_NAME = os.getenv('MODEL_PACK_NAME', 'buffalo_l')
 
-# Time to hover before landing (seconds)
-HOVER_DURATION = 60 # Adjust as needed
+# Time to run before landing (seconds)
+FLIGHT_DURATION = 120 # Increased duration for testing centering
 
 # Cooldown period (seconds) after recognizing someone before logging again
 RECOGNITION_COOLDOWN = 5
 
+# --- Drone Control Parameters ---
+# Target face height as a ratio of the frame height
+TARGET_FACE_HEIGHT_RATIO = 0.25 # Aim for face to be 25% of frame height
+# Proportional gains for controller ( এগুলো পরিবর্তন করুন / Adjust these values)
+KP_YAW = 0.25   # How strongly to react to horizontal error
+KP_UD = 0.2     # How strongly to react to vertical error (REDUCED from 0.4)
+KP_FB = 0.3     # How strongly to react to size error (forward/backward)
+# Maximum control velocities (range: -100 to 100)
+MAX_YAW_VEL = 60
+MAX_UD_VEL = 70
+MAX_FB_VEL = 50
+# Dead zone for control errors (ignore small errors to prevent jitter)
+ERROR_DEAD_ZONE_X = 15  # Pixels
+ERROR_DEAD_ZONE_Y = 15  # Pixels
+ERROR_DEAD_ZONE_H = 10 # Pixels (for height difference)
+# Time to hover without face before searching (seconds)
+SEARCH_TIMEOUT = 3.0
+SEARCH_YAW_VEL = 25 # Slow rotation speed when searching
+
 # --- Helper Functions ---
-def draw_face_info(frame, faces_data, recognition_results):
-    """Draws bounding boxes and recognition info on the frame."""
+def draw_face_info(frame, faces_data, target_face_index):
+    """Draws bounding boxes and recognition info on the frame.
+       Highlights the target face.
+    """
     for i, face_data in enumerate(faces_data):
         bbox = face_data['bbox']
-        score = face_data['det_score']
-        name = recognition_results.get(i, (None, None))[0] # Get name from results
-        distance = recognition_results.get(i, (None, None))[1]
+        name = face_data.get('name') # Get name added during processing
+        distance = face_data.get('distance')
 
-        # Box color: Green if recognized, Red if unknown/below threshold
+        # Box color: Green if recognized, Red if unknown
         color = (0, 255, 0) if name else (0, 0, 255)
+        thickness = 2
+        # Highlight the target face
+        if i == target_face_index:
+            color = (255, 255, 0) # Cyan for target
+            thickness = 3
+
         label = "Unknown"
         if name:
             label = f"{name} ({distance:.2f})"
-        else:
-            # If distance is available (closest match but below threshold), show it
-            if distance is not None:
-                label = f"Unknown ({distance:.2f})"
+        elif distance is not None: # Show distance even if unknown but match found
+             label = f"Unknown ({distance:.2f})"
 
         # Draw bounding box
-        cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+        cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, thickness)
 
         # Prepare label text
         label_size, base_line = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
@@ -104,70 +129,137 @@ def main():
             drone.land() # Attempt landing just in case
             drone.disconnect()
             return
-        logging.info(f"Drone airborne. Hovering and starting recognition loop for {HOVER_DURATION} seconds.")
+        logging.info(f"Drone airborne. Starting recognition and centering loop for {FLIGHT_DURATION} seconds.")
 
         start_time = time.time()
         frame_count = 0
         fps = 0
+        last_face_seen_time = time.time() # Track when a face was last detected
 
-        # 7. Main Loop (Hover, Recognize, Display)
-        while keep_running and (time.time() - start_time) < HOVER_DURATION:
+        # 7. Main Loop (Control, Recognize, Display)
+        while keep_running and (time.time() - start_time) < FLIGHT_DURATION:
             loop_start_time = time.time()
 
             # Get frame from drone
             frame = drone.get_frame()
             if frame is None:
                 logging.warning("Failed to get frame from drone. Skipping cycle.")
-                # Keep hovering command active even if frame fails
                 if drone.is_flying:
-                     drone.hover()
-                time.sleep(0.1) # Avoid busy-waiting
+                     drone.send_rc_control(0, 0, 0, 0)
+                time.sleep(0.1)
                 continue
 
-            # Keep drone hovering
-            if drone.is_flying:
-                drone.hover()
-
-            # Resize frame for faster processing (optional)
-            # small_frame = cv2.resize(frame, (640, 480))
-            small_frame = frame # Process original frame for now
+            # --- Face Detection and Recognition ---
+            frame_height, frame_width, _ = frame.shape
+            frame_center_x = frame_width // 2
+            frame_center_y = frame_height // 2
+            target_face_height = frame_height * TARGET_FACE_HEIGHT_RATIO
 
             # Analyze frame for faces
-            # Run analysis less frequently if needed for performance
-            faces_data = face_recognizer.analyze_frame(small_frame)
-
-            recognition_results = {} # Store results for this frame {index: (name, distance)}
+            faces_data = face_recognizer.analyze_frame(frame)
             current_time = time.time()
+            recognized_faces = []
+            unknown_faces = []
 
-            # Process detected faces
+            # Process and classify all detected faces
             if faces_data:
-                logging.debug(f"Detected {len(faces_data)} faces.")
+                last_face_seen_time = current_time # Reset timer
                 for i, face in enumerate(faces_data):
+                    face['original_index'] = i # Keep track of original index for display
+                    bbox = face['bbox']
+                    face['area'] = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
                     embedding = face.get('embedding')
+                    name = None
+                    distance = None
                     if embedding is not None:
-                        # Find similar face in DB
                         name, distance = db_utils.find_similar_face(embedding)
-                        recognition_results[i] = (name, distance)
-
-                        # Log recognized person if cooldown period passed
+                        face['name'] = name # Add recognition result directly to face data
+                        face['distance'] = distance
                         if name:
+                            recognized_faces.append(face)
+                             # Log recognized person if cooldown period passed
                             last_seen = recognized_log.get(name, 0)
                             if current_time - last_seen > RECOGNITION_COOLDOWN:
-                                logging.info(f"RECOGNIZED: {name} (Distance: {distance:.4f})")
+                                logging.info(f"RECOGNIZED: {name} (Distance: {distance:.4f}) - Tracking")
                                 recognized_log[name] = current_time
-                        # else: logging.debug(f"Face {i} is unknown or below threshold (Dist: {distance})")
+                        else:
+                            unknown_faces.append(face)
                     else:
+                        # If embedding failed, treat as unknown but don't add to unknown_faces list for targeting
                         logging.warning(f"Face {i} detected but embedding extraction failed.")
+                        face['name'] = None
+                        face['distance'] = None
             # else: logging.debug("No faces detected in this frame.")
 
+            # --- Target Selection Logic ---
+            target_face = None
+            target_face_index = -1 # Original index for highlighting
+
+            if recognized_faces:
+                # Priority 1: Target the largest recognized face
+                recognized_faces.sort(key=lambda x: x['area'], reverse=True)
+                target_face = recognized_faces[0]
+                target_face_index = target_face['original_index']
+                logging.debug(f"Targeting recognized face: {target_face['name']}")
+            elif unknown_faces:
+                # Priority 2: Target the largest unknown face
+                unknown_faces.sort(key=lambda x: x['area'], reverse=True)
+                target_face = unknown_faces[0]
+                target_face_index = target_face['original_index']
+                logging.debug("Targeting largest unknown face.")
+            # else: No faces detected, target_face remains None
+
+            # --- Drone Control Logic ---
+            yaw_velocity = 0
+            ud_velocity = 0
+            fb_velocity = 0
+
+            if target_face and drone.is_flying:
+                bbox = target_face['bbox']
+                face_center_x = (bbox[0] + bbox[2]) // 2
+                face_center_y = (bbox[1] + bbox[3]) // 2
+                face_height = bbox[3] - bbox[1]
+
+                error_x = face_center_x - frame_center_x
+                error_y = frame_center_y - face_center_y
+                error_fb = target_face_height - face_height
+
+                if abs(error_x) > ERROR_DEAD_ZONE_X:
+                    yaw_velocity = KP_YAW * error_x
+                if abs(error_y) > ERROR_DEAD_ZONE_Y:
+                    ud_velocity = KP_UD * error_y
+                if abs(error_fb) > ERROR_DEAD_ZONE_H:
+                    fb_velocity = KP_FB * error_fb
+
+                yaw_velocity = int(np.clip(yaw_velocity, -MAX_YAW_VEL, MAX_YAW_VEL))
+                ud_velocity = int(np.clip(ud_velocity, -MAX_UD_VEL, MAX_UD_VEL))
+                fb_velocity = int(np.clip(fb_velocity, -MAX_FB_VEL, MAX_FB_VEL))
+
+                logging.debug(f"Control: Target '{target_face.get('name', 'Unknown')}' Err(x:{error_x}, y:{error_y}, h:{error_fb}) -> Vel(yaw:{yaw_velocity}, ud:{ud_velocity}, fb:{fb_velocity})")
+                drone.send_rc_control(0, fb_velocity, ud_velocity, yaw_velocity)
+
+            elif drone.is_flying:
+                # No target face selected (either no faces or only faces with failed embeddings)
+                time_since_last_face = current_time - last_face_seen_time
+                if time_since_last_face < SEARCH_TIMEOUT:
+                    logging.debug("No targetable face detected, hovering...")
+                    drone.send_rc_control(0, 0, 0, 0)
+                else:
+                    logging.debug(f"No targetable face detected for {time_since_last_face:.1f}s, searching...")
+                    drone.send_rc_control(0, 0, 0, SEARCH_YAW_VEL)
+
+            # --- Display Information ---
             # Calculate FPS
             frame_count += 1
             elapsed_time = time.time() - loop_start_time
             if elapsed_time > 0:
                  fps = 1.0 / elapsed_time
 
-            # Draw info on the (original size) frame
-            display_frame = draw_face_info(frame.copy(), faces_data, recognition_results)
+            # Draw info on the frame, highlighting the target
+            display_frame = draw_face_info(frame.copy(), faces_data, target_face_index)
+
+            # Draw frame center (already done in draw_face_info if needed, or keep here)
+            # cv2.circle(display_frame, (frame_center_x, frame_center_y), 5, (255, 0, 0), -1)
 
             # Add FPS to display
             cv2.putText(display_frame, f"FPS: {fps:.1f}", (display_frame.shape[1] - 100, 30),
@@ -187,8 +279,8 @@ def main():
                 keep_running = False
 
         # Check if loop exited due to duration limit
-        if time.time() - start_time >= HOVER_DURATION:
-            logging.info(f"Hover duration ({HOVER_DURATION}s) reached. Landing.")
+        if time.time() - start_time >= FLIGHT_DURATION:
+            logging.info(f"Flight duration ({FLIGHT_DURATION}s) reached. Landing.")
 
     except KeyboardInterrupt:
         logging.info("KeyboardInterrupt received. Landing and exiting.")
@@ -204,6 +296,9 @@ def main():
         if 'drone' in locals(): # Check if drone object was initialized
             if drone.is_flying: # Land if still flying
                 logging.info("Ensuring drone is landed...")
+                # Send zero velocity before landing
+                drone.send_rc_control(0, 0, 0, 0)
+                time.sleep(0.5)
                 drone.land()
                 time.sleep(5) # Wait for landing
             drone.disconnect()
